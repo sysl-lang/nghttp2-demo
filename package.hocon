@@ -1,0 +1,25 @@
+// The worked example for `sh.sysl.nghttp2` — HTTP/2 over TLS, negotiated by ALPN, with no socket.
+//
+// **Two packages that have never heard of each other, composed.** `sh.sysl.openssl` turns bytes
+// into ciphertext and back; `sh.sysl.nghttp2` turns bytes into HTTP/2 frames and back. Neither owns
+// a file descriptor, so the whole of `h2` — a real TLS handshake, a real ALPN negotiation, a real
+// connection preface, a real request and a real response — runs in one process with the four
+// buffers crossed by hand.
+//
+// That is the point of the demo rather than a shortcut in it: a composition that needs a port is a
+// composition nobody can check on a train.
+
+package {
+  name    = "nghttp2-demo"
+  version = "0.1.0"
+}
+
+dependencies {
+  nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.1.0" }
+  openssl { git = "github.com/sysl-lang/openssl", version = "0.2.0" }
+}
+
+requires {
+  heap  = true
+  posix = true
+}

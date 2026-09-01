@@ -1,0 +1,217 @@
+// HTTP/2 over TLS, both ends in one process, with no socket anywhere.
+//
+// **What this is for is the seam.** `sh.sysl.openssl` and `sh.sysl.nghttp2` were written months and
+// a repository apart and neither names the other; what they have in common is that neither owns a
+// file descriptor. So a `h2` connection is four buffers and a loop:
+//
+//     plaintext  --> TLS stream --> ciphertext --> the peer's TLS stream --> plaintext
+//        ^                                                                      |
+//        +------------------------- HTTP/2 session <----------------------------+
+//
+// The program drives a real TLS 1.3 handshake between two `Stream`s, checks that ALPN settled on
+// `h2`, and then runs a GET and its answer through the encrypted pipe -- connection preface, HPACK,
+// DATA frame and all. Nothing here is a mock: the certificate is real, the handshake is real, and
+// the twenty-four preface bytes really do go through the cipher.
+
+import sh.sysl.nghttp2.{client as h2_client, server as h2_server, header, offers_h2, alpn_list,
+    Event, Session}
+import sh.sysl.openssl.{client as tls_client, server as tls_server, connect, accept, Step, Stream}
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// A self-signed certificate for `localhost` and its key, generated with `openssl req -x509 -newkey
+// ec` and good until 2126. **A fixture with a near expiry is a demo that stops working on a date
+// nobody chose.**
+private certificate() -> string = raw"""
+    -----BEGIN CERTIFICATE-----
+    MIIBlTCCATugAwIBAgIUNnjUBn4q7ivoXFJz0saQZ08Pg5swCgYIKoZIzj0EAwIw
+    FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDgyOTE3NTA0NVoYDzIxMjYwODA1
+    MTc1MDQ1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+    PQMBBwNCAARZbqWolNURbZ5e+9vJOe4TUurlpW+RHEs8akmv+IIIIA/rj97/iCuM
+    BhyvxVOtuyLYisY/u8tssfGB9Ae2cToOo2kwZzAdBgNVHQ4EFgQUVFT1Ath9z+UO
+    ZTtYvB+5kS4sWbowHwYDVR0jBBgwFoAUVFT1Ath9z+UOZTtYvB+5kS4sWbowDwYD
+    VR0TAQH/BAUwAwEB/zAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwID
+    SAAwRQIgT5Z9B0gkwqI38hKMz4j6Qfz7soV1nIJDkQL2ybMM/v8CIQDL4P1sRuQe
+    l1AsfZSnSUHdcgf31iyWtYdG7TDjTT1SSQ==
+    -----END CERTIFICATE-----
+    """
+
+private key() -> string = raw"""
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgBb9GvwtNPeyKbu1H
+    iKg570Z07OItc1S5qkEx3mMK0HGhRANCAARZbqWolNURbZ5e+9vJOe4TUurlpW+R
+    HEs8akmv+IIIIA/rj97/iCuMBhyvxVOtuyLYisY/u8tssfGB9Ae2cToO
+    -----END PRIVATE KEY-----
+    """
+
+// Move all the ciphertext one end has to write into the other end's input.
+//
+// **This is the socket, and it is nine lines.** Everything a real deployment would do differently
+// is on this side of the seam; neither library above changes at all.
+private pump(from: &Stream, to: &Stream) -> usize
+    var wire: [16384]u8
+    var moved: usize = 0
+
+    loop
+        val n = from.outgoing(wire[0..<16384])
+
+        if n == 0 then break
+
+        to.incoming(wire[0..<n]).unwrap()
+
+        moved += n
+
+    moved
+end pump
+
+// Drive both ends of the TLS handshake until it settles.
+//
+// **The order is ask-then-drain and it is not free.** Draining first sends nothing, and both ends
+// then wait for each other forever -- which in a program with no timeout is a hang rather than a
+// failure. The round count is the safety net.
+private settle(cl: &Stream, sv: &Stream)
+    for round in 0..<16
+        val a = cl.handshake().unwrap()
+
+        pump(cl, sv)
+
+        val b = sv.handshake().unwrap()
+
+        pump(sv, cl)
+
+        a match
+            Done -> b match
+                Done -> return
+                Wants -> ()
+            Wants -> ()
+
+    print("the handshake did not settle")
+    exit(1)
+end settle
+
+// Everything an HTTP/2 session wants to write, through TLS, to the peer's session.
+//
+// **Three steps and the middle one is the whole demo**: the session's bytes go into `Stream.send`
+// as plaintext, come out of `Stream.outgoing` as ciphertext, cross, and are decrypted back into the
+// peer's `receive`. Neither session ever sees a cipher and neither stream ever sees a frame.
+private carry(from: &Session, over: &Stream, into: &Stream, to: &Session)
+    var plain: Buf[u8] = buf()
+
+    from.send(&plain).unwrap()
+
+    if plain.len() > 0 then over.send(plain.view()).unwrap()
+
+    pump(over, into)
+
+    var out: [16384]u8
+
+    loop
+        into.receive(out[0..<16384]).unwrap() match
+            Data(n) ->
+                to.receive(out[0..<n]).unwrap()
+            Wants -> break
+            Closed -> break
+end carry
+
+private show(who: string, s: &Session)
+    loop
+        s.next_event() match
+            Some(e) -> e match
+                Headers(id, hs, kind) ->
+                    var line = ""
+
+                    for i in 0..<hs.len()
+                        if i > 0 then line += ", "
+
+                        val h = hs.at(i)
+
+                        line += s"${h.name}: ${h.value}"
+
+                    print(s"  ${who} stream ${id} headers -- ${line}")
+                Data(id, bytes) ->
+                    print(s"  ${who} stream ${id} body -- ${from_utf8_unchecked(bytes.view())}")
+                StreamEnd(id) -> print(s"  ${who} stream ${id} ended")
+                StreamClose(id, code) -> print(s"  ${who} stream ${id} closed")
+                Settings -> print(s"  ${who} the peer's settings arrived")
+                _ -> ()
+            None -> break
+end show
+
+// -- the program ---------------------------------------------------------------------------------
+
+print("TLS 1.3, ALPN and HTTP/2, with no socket in the program")
+print("")
+
+// **Both ends offer `h2` first.** The server's own order is what decides, which is `sh.sysl.openssl`'s
+// choice and the right one: the server is the end that knows which protocol it serves well.
+var cl_ctx = tls_client().unwrap()
+
+cl_ctx.trust(certificate().bytes).unwrap()
+cl_ctx.offer(["h2", "http/1.1"]).unwrap()
+
+var sv_ctx = tls_server(certificate().bytes, key().bytes).unwrap()
+
+sv_ctx.offer(["h2", "http/1.1"]).unwrap()
+
+var cl_tls = connect(cl_ctx, "localhost").unwrap()
+var sv_tls = accept(sv_ctx).unwrap()
+
+settle(cl_tls, sv_tls)
+
+print("handshake done")
+
+// **This is the negotiation the whole card was blocked on.** There is no other way to reach HTTP/2
+// over TLS: no upgrade header, no version marker, nothing in the request. Either ALPN said `h2` or
+// this is an HTTP/1.1 connection.
+val chosen = cl_tls.protocol().unwrap_or("(none)")
+
+print(s"ALPN chose ${chosen} at the client, ${sv_tls.protocol().unwrap_or("(none)")} at the server")
+
+if chosen != "h2"
+    print("ALPN did not settle on h2, so there is no HTTP/2 to run")
+    exit(1)
+
+// And the same question asked of nghttp2 rather than of OpenSSL, over the wire-format list a TLS
+// library actually exchanges.
+print(s"nghttp2 agrees the list offers h2: ${offers_h2(alpn_list(["h2", "http/1.1"]).unwrap().view())}")
+print("")
+
+var cl_h2 = h2_client().unwrap()
+var sv_h2 = h2_server().unwrap()
+
+// The client's opening bytes are the connection preface and its SETTINGS -- through the cipher.
+carry(cl_h2, cl_tls, sv_tls, sv_h2)
+carry(sv_h2, sv_tls, cl_tls, cl_h2)
+
+print("connection open")
+show("server:", sv_h2)
+show("client:", cl_h2)
+print("")
+
+val id = cl_h2.request([header(":method", "GET"), header(":scheme", "https"),
+    header(":path", "/hello"), header(":authority", "localhost"),
+    header("user-agent", "sysl-nghttp2-demo")]).unwrap()
+
+print(s"GET /hello on stream ${id}")
+
+carry(cl_h2, cl_tls, sv_tls, sv_h2)
+show("server:", sv_h2)
+print("")
+
+val body = "Hello from a sysl HTTP/2 server.\n"
+
+sv_h2.respond(id, [header(":status", "200"), header("content-type", "text/plain"),
+    header("content-length", str(body.bytes.len))], Some(body.bytes)).unwrap()
+
+carry(sv_h2, sv_tls, cl_tls, cl_h2)
+
+print("the answer, decrypted and unframed:")
+show("client:", cl_h2)
+print("")
+
+// A GOAWAY naming the last stream served, so the peer knows what may be retried and what may not.
+sv_h2.goaway(sv_h2.last_stream()).unwrap()
+
+carry(sv_h2, sv_tls, cl_tls, cl_h2)
+
+print("done")
