@@ -1,3 +1,4 @@
 github.com/sysl-lang/nghttp2 v0.1.0 sha256:2dda356fe5d162ede7d14dd85feafdf17fcdad100b054472b9d93e623562720a
 github.com/sysl-lang/nghttp2 v0.3.1 sha256:d24325b2cff0d4749e77cf652ff14550b348b98daf28cda1e6ba521d1e62194f
+github.com/sysl-lang/nghttp2 v0.3.2 sha256:876bd5090de16dcecb1d41331718a43ad22abcb5a6248023d9a6cf2c7d282c60
 github.com/sysl-lang/openssl v0.2.0 sha256:4aedbee5b0c3d802b8855b749a69155db4ec1fad5bbf6db42db08cf87dc8eb64
