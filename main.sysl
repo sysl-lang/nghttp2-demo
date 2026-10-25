@@ -201,7 +201,7 @@ print("")
 val body = "Hello from a sysl HTTP/2 server.\n"
 
 sv_h2.respond(id, [header(":status", "200"), header("content-type", "text/plain"),
-    header("content-length", str(body.bytes.len))], Some(body.bytes)).unwrap()
+    header("content-length", body.bytes.len.to_string())], Some(body.bytes)).unwrap()
 
 carry(sv_h2, sv_tls, cl_tls, cl_h2)
 
